@@ -1,0 +1,7 @@
+id=breakwall
+name=BreakWall
+version=v1.0
+versionCode=20241203
+author=Tony
+description=Created on 12 03, 2024.
+updateJson=https://github.com/coomsn/breakwall/raw/main/update.json

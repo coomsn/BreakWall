@@ -1,0 +1,61 @@
+#!/system/bin/sh
+scripts=$(realpath $0)
+scripts_dir=$(dirname ${scripts})
+parent_dir=$(dirname ${scripts_dir})
+module_dir="/data/adb/modules/breakwall"
+
+clear
+echo "Upgrade xray files."
+source ${scripts_dir}/breakwall.service
+
+# Get the latest version tag name，Not ignor Pre-release
+latest_version=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases | grep -m 1 -oE '"tag_name": *"v[0-9]+\.[0-9]+\.[0-9]+"' | awk -F '"' '{print $4}')
+# Check if ${latest_version} is empty
+if [ -z "${latest_version}" ]; then
+  echo "Failed to retrieve the latest version. Exiting script."
+  exit 1  # Exit the script with a non-zero status code to indicate failure
+fi
+
+# Construct the download URL (assuming you need the Android ARM64 version)
+case "$(uname -m)" in
+    'armv8' | 'aarch64')
+      MACHINE='arm64-v8a'
+      ;;
+    *)
+      echo "error: The architecture is not supported."
+      exit 1
+      ;;
+esac
+
+download_url="https://github.com/XTLS/Xray-core/releases/download/${latest_version}/Xray-android-${MACHINE}.zip"
+
+# Set the download filename
+filename="Xray-android-${MACHINE}.zip"
+
+# Download the file
+echo "downloading xray ${latest_version} ..."
+curl -L --progress-bar -o ${filename} ${download_url}
+
+# Check if the file was downloaded successfully
+if [ -f "${scripts_dir}/${filename}" ]; then
+  # Stop the xray process
+  kill $(pidof xray) > /dev/null 2>&1
+  sleep 2
+  # Unzip the file and overwrite existing files
+  unzip -o ${filename} -d ${parent_dir}/binary
+  # Clean up the zip file
+  rm ${filename}
+  echo -e "xray \e[31m${latest_version}\e[0m downloaded and extracted to ${parent_dir}/binary/"
+  log Warn "wait a moment"
+  sleep 2
+# restart service
+if [ ! -f "${module_dir}/disable" ]; then
+  stop_tproxy 2>/dev/null && sleep 3 && start_tproxy 2>/dev/null
+  else
+  log Warn "module is not enabled"
+fi
+else
+  echo "File download failed."
+  exit 1  # Exit the script with a non-zero status code to indicate failure
+fi
+# {version1.0}

@@ -1,0 +1,21 @@
+#!/system/bin/sh
+scripts=$(realpath $0)
+scripts_dir=$(dirname ${scripts})
+parent_dir=$(dirname ${scripts_dir})
+
+source "${scripts_dir}/breakwall.service"
+
+events=$1
+monitor_file=$3
+
+if [ "${monitor_file}" = "disable" ]; then
+  case "${events}" in
+    "d")
+      start_tproxy >/dev/null 2>&1
+      ;;
+    "n")
+      stop_tproxy >/dev/null 2>&1
+      ;;
+  esac
+fi
+# {version1.0}

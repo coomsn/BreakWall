@@ -1,0 +1,282 @@
+#!/system/bin/sh
+scripts=$(realpath $0)
+scripts_dir=$(dirname ${scripts})
+parent_dir=$(dirname ${scripts_dir})
+
+clear
+
+source ${scripts_dir}/settings.ini
+
+# check iptables_version
+iptables_version=$(iptables --version | busybox awk '/^iptables/ {print $2}')
+required_version="v1.6.1"
+if [ "$(printf '%s\n' "$required_version" "$iptables_version" | sort -V | head -n1)" = "$required_version" ]; then
+  IPV="iptables -w 64"
+  IP6V="ip6tables -w 64"
+else
+  IPV="iptables"
+  IP6V="ip6tables"
+fi
+
+log() {
+  export TZ=Asia/Shanghai
+  now=$(date +"[%Y-%m-%d %H:%M:%S %Z]")
+  case $1 in
+    Info)
+      [ -t 1 ] && echo -e "\033[1;32m${now} [Info]: $2\033[0m" || echo "${now} [Info]: $2"
+      ;;
+    Warn)
+      [ -t 1 ] && echo -e "\033[1;33m${now} [Warn]: $2\033[0m" || echo "${now} [Warn]: $2"
+      ;;
+    Error)
+      [ -t 1 ] && echo -e "\033[1;31m${now} [Error]: $2\033[0m" || echo "${now} [Error]: $2"
+      ;;
+    *)
+      [ -t 1 ] && echo -e "\033[1;30m${now} [$1]: $2\033[0m" || echo "${now} [$1]: $2"
+      ;;
+  esac
+}
+
+# Function to filter UIDs based on package names
+uid_filter() {
+  [ -f "${scripts_dir}/uids.list" ] && rm "${scripts_dir}/uids.list"
+  uid=""; uids=""
+  for package_name in ${package_list[@]}; do
+    uid=$(busybox awk -v package="${package_name}" '$1 ~ package {print $2}' /data/system/packages.list)
+    [ -n "${uid}" ] && uids+=("${uid}") &&\
+    echo "${package_name}: ${uid}" >> ${scripts_dir}/uids.list
+  done
+}
+
+# Function to start the proxy
+start_tproxy() {
+if pidof ${Bin} > /dev/null 2>&1; then
+    log Info "Close existing processes $(pidof ${Bin})"
+    stop_tproxy
+fi
+if [ -f "${Bin}" ]; then
+  chmod +x ${Bin}
+  chown root:net_admin ${Bin}
+  uid_filter
+  chain_name="${Bin##*/}"
+  run_iptables_rules
+  run_disable_quic
+  ulimit -SHn 1000000
+  wait
+  nohup busybox setuidgid ${xray_user}:${xray_group} ${Bin} run -confdir ${config_dir} > /dev/null 2>&1 &
+  am start -a android.intent.action.VIEW -n com.jozein.xedgepro/.ui.ActivityPerformAction --ei __0 111 --es __1 "代理已开启" >/dev/null 2>&1
+  # description "✔" "is running."
+else
+  log Error "Binary ${Bin} not found"
+  am start -a android.intent.action.VIEW -n com.jozein.xedgepro/.ui.ActivityPerformAction --ei __0 111 --es __1 "${Bin##*/} not found" >/dev/null 2>&1
+  exit 1
+fi
+echo "${Bin##*/}:$(pidof ${Bin})" > ${scripts_dir}/pid.txt
+log Info "Create a new process $(pidof ${Bin})"
+cron_task
+}
+
+# Function to stop the proxy
+stop_tproxy() {
+if ! pidof "${Bin}" >/dev/null 2>&1; then
+    exit 1
+fi
+if [ -f "${scripts_dir}/pid.txt" ] ; then
+  chain_name=$(awk -F ':' 'NR==1 {print $1}' ${scripts_dir}/pid.txt)
+  run_del_iptables_rules > /dev/null 2>&1
+  del_disable_quic
+  del_task
+  # description "✘" "was stopped."
+  killall $(awk -F ':' 'NR==1 {print $1}' ${scripts_dir}/pid.txt) > /dev/null 2>&1
+  kill -9 $(awk -F ':' 'NR==1 {print $2}' ${scripts_dir}/pid.txt) > /dev/null 2>&1
+  am start -a android.intent.action.VIEW -n com.jozein.xedgepro/.ui.ActivityPerformAction --ei __0 111 --es __1 "代理已关闭" >/dev/null 2>&1
+  rm ${scripts_dir}/*.list
+  rm ${parent_dir}/logs/*.log
+  rm ${scripts_dir}/pid.txt
+fi
+}
+
+# Function to create TPROXY rules
+iptables_rules() {
+  ${1} rule add fwmark "${fwmark}" table ${2} pref $(( ${2} * 10 ))
+  ${1} route add local default dev lo table ${2}
+  # Create custom chain
+  ${3} -t mangle -N ${4}_EXTERNAL
+  ${3} -t mangle -F ${4}_EXTERNAL
+  ${3} -t mangle -N ${4}_LOCAL
+  ${3} -t mangle -F ${4}_LOCAL
+  ${3} -t mangle -N DIVERT
+  ${3} -t mangle -F DIVERT
+  
+# Create custom chain rules
+  ${3} -t mangle -A ${4}_LOCAL -p udp --dport 53 -j MARK --set-mark ${fwmark}
+  ${3} -t mangle -A ${4}_LOCAL -p tcp --dport 53 -j MARK --set-mark ${fwmark}
+  
+  ${3} -t mangle -A ${4}_EXTERNAL -p udp --dport 53 -j TPROXY --on-port ${tp_port} --tproxy-mark ${fwmark}
+  ${3} -t mangle -A ${4}_EXTERNAL -p tcp --dport 53 -j TPROXY --on-port ${tp_port} --tproxy-mark ${fwmark}
+
+  for subnet in ${5}; do
+    ${3} -t mangle -A ${4}_EXTERNAL -d ${subnet} -j RETURN
+    ${3} -t mangle -A ${4}_LOCAL -d ${subnet} -j RETURN
+  done
+
+  ${3} -t mangle -A ${4}_EXTERNAL -p tcp -i lo -j TPROXY --on-port ${tp_port} --tproxy-mark ${fwmark}
+  ${3} -t mangle -A ${4}_EXTERNAL -p udp -i lo -j TPROXY --on-port ${tp_port} --tproxy-mark ${fwmark}
+  
+  if [ "${ap_list}" != "" ]; then
+  for ap in ${ap_list[@]} ; do
+    ${3} -t mangle -A ${4}_EXTERNAL -p tcp -i "${ap}" -j TPROXY --on-port "${tp_port}" --tproxy-mark "${fwmark}"
+    ${3} -t mangle -A ${4}_EXTERNAL -p udp -i "${ap}" -j TPROXY --on-port "${tp_port}" --tproxy-mark "${fwmark}"
+  done
+fi  
+
+case "${proxy_mode}" in
+  "blacklist")
+    for appid in ${6}; do
+      ${3} -t mangle -A ${4}_LOCAL -m owner --uid-owner ${appid} -p tcp -j RETURN
+      ${3} -t mangle -A ${4}_LOCAL -m owner --uid-owner ${appid} -p udp ! --dport 53 -j RETURN
+    done
+    ${3} -t mangle -A ${4}_LOCAL -j MARK --set-mark ${fwmark}
+    ;;
+  "whitelist")
+    for appid in ${6}; do
+      ${3} -t mangle -A ${4}_LOCAL -m owner --uid-owner ${appid} -p tcp -j MARK --set-mark ${fwmark}
+      ${3} -t mangle -A ${4}_LOCAL -m owner --uid-owner ${appid} -p udp -j MARK --set-mark ${fwmark}
+    done
+    if [ -n "${AIDs}" ]; then
+      for AID in ${AIDs[*]}; do
+        ${3} -t mangle -A ${4}_LOCAL -m owner --uid-owner ${AID} -p tcp -j MARK --set-mark ${fwmark}
+        ${3} -t mangle -A ${4}_LOCAL -m owner --uid-owner ${AID} -p udp -j MARK --set-mark ${fwmark}
+      done
+    else
+      echo "Invalid proxy_mode: ${proxy_mode}"
+    fi
+    ;;
+  *)
+    echo "Invalid proxy_mode: ${proxy_mode}"
+    ;;
+esac
+
+# Loopback prevention rules 1
+${3} -t mangle -I ${4}_LOCAL -m owner --gid-owner ${xray_group} -j RETURN
+# Loopback prevention rules 2
+${3} -t mangle -A DIVERT -j MARK --set-mark "${fwmark}"
+${3} -t mangle -A DIVERT -j ACCEPT
+
+# Referencing custom chains
+${3} -t mangle -A PREROUTING -j ${4}_EXTERNAL
+${3} -t mangle -I PREROUTING -p tcp -m socket -j DIVERT
+${3} -t mangle -A OUTPUT -j ${4}_LOCAL
+}
+
+# Function to execute proxy rules
+run_iptables_rules() {
+iptables_rules ip "${table}" "${IPV}" "${chain_name}" "${intranet[*]}" "${uids[*]}"
+if [ "${ip6tables_switch}" = true ]; then
+  iptables_rules "ip -6" "$(( ${table} * 2 ))" "${IP6V}" "${chain_name}6" "${intranet6[*]}" "${uids[*]}"
+fi
+}
+
+# Function to delete proxy rules
+del_iptables_rules() {
+${1} rule del fwmark "${fwmark}" table ${2} pref $(( ${2} * 10 ))
+${1} route del local default dev lo table ${2}
+${1} route flush table ${2}
+# First, delete the reference chain, otherwise the custom chain cannot be deleted.
+${3} -t mangle -D PREROUTING -j ${4}_EXTERNAL
+${3} -t mangle -D PREROUTING -p tcp -m socket -j DIVERT
+${3} -t mangle -D OUTPUT -j ${4}_LOCAL
+# Secondly, delete the custom rules of the custom chain.
+${3} -t mangle -F ${4}_EXTERNAL
+${3} -t mangle -F DIVERT
+${3} -t mangle -F ${4}_LOCAL
+# Finally, delete the custom chain.
+${3} -t mangle -X ${4}_EXTERNAL
+${3} -t mangle -X DIVERT
+${3} -t mangle -X ${4}_LOCAL
+}
+
+# Function to execute delete proxy rules
+run_del_iptables_rules() {
+del_iptables_rules ip "${table}" "${IPV}" "${chain_name}"
+if [ "${ip6tables_switch}" = true ]; then
+  del_iptables_rules "ip -6" "$(( ${table} * 2 ))" "${IP6V}" "${chain_name}6"
+fi
+}
+
+# Function to create task
+cron_task() {
+if [ "${crond_task}" = true ]; then
+  crontab_file="${scripts_dir}/root"
+  if pgrep busybox crond > /dev/null; then
+    kill -9 $(pgrep busybox crond)
+  fi
+  echo '5 0,12 * * * touch /data/adb/modules/breakwall/disable && sleep 3 && rm /data/adb/modules/breakwall/disable' > ${crontab_file}
+  nohup busybox crond -c ${scripts_dir}/ > /dev/null 2>&1 &
+  log Info "New task: $(busybox crontab -l -c ${scripts_dir}/)"
+else
+  log Warn "crond_task is not set to true. No crond task created."
+fi
+}
+
+# Function to delete task
+del_task() {
+if pgrep busybox crond > /dev/null; then
+  kill -9 $(pgrep busybox crond)
+  rm ${scripts_dir}/root > /dev/null 2>&1
+fi
+}
+
+# disable / enable quic using iptables rules 
+quic="disable"
+
+# Disable QUIC
+disable_quic() {
+${1} ${2} OUTPUT -p udp --dport 443 -m owner ! --uid-owner ${xray_user} ! --gid-owner ${xray_group} -j REJECT
+${1} ${2} OUTPUT -p udp --dport 80 -m owner ! --uid-owner ${xray_user} ! --gid-owner ${xray_group} -j REJECT
+}
+
+run_disable_quic() {
+if [ "${quic}" = "disable" ]; then
+  disable_quic "${IPV}" "-I"
+  if [ "${ip6tables_switch}" = true ]; then
+  disable_quic "${IP6V}" "-I"
+  fi
+fi
+}
+
+del_disable_quic() {
+if [ "${quic}" = "disable" ]; then
+  disable_quic "${IPV}" "-D"
+  if [ "${ip6tables_switch}" = true ]; then
+  disable_quic "${IP6V}" "-D"
+  fi
+fi
+}
+
+# version
+version() {
+if [ -f "${Bin}" ]; then
+  version=$(${Bin} version | head -n 1 | awk '{print $2}')
+fi
+}
+
+description() {
+local symbol=$1
+local event=$2
+version
+prop_file="/data/adb/modules/breakwall/module.prop"
+core_name="${chain_name}"
+current_time=$(date "+[%m.%d %H:%M]")
+sed -i "/description/c\description=${current_time} ${symbol} ${core_name} ${version} ${network_mode} ${event}" "${prop_file}"
+}
+# {version1.0}
+
+case "$1" in
+    enable)
+        start_tproxy
+        ;;
+    disable)
+        stop_tproxy
+        ;;
+esac
