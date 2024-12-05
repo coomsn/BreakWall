@@ -3,6 +3,7 @@ clear
 scripts=$(realpath $0)
 scripts_dir=$(dirname ${scripts})
 module_dir="/data/adb/modules/breakwall"
+cd ${scripts_dir}
 # Environment variable settings
 export PATH="/data/adb/ap/bin:/data/adb/ksu/bin:/data/adb/magisk:$PATH"
 source ${scripts_dir}/breakwall.service
